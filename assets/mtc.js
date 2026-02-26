@@ -35,6 +35,11 @@
   const batchId = getBatchId();
   const rowMap = new Map(); // jobId -> row DOM
   const maxQueuedUiMs = Number(cfg.maxQueuedUiMs || 6000);
+  const pollIntervalMs = Math.max(500, Number(cfg.pollIntervalMs || 2000));
+  const pollMaxBackoffMs = Math.max(
+    pollIntervalMs,
+    Number(cfg.pollMaxBackoffMs || 15000)
+  );
 
   function waitingLabel(cssClass, text) {
     return `
@@ -136,13 +141,24 @@
       }
     );
 
-    const json = await resp.json();
-    if (!json || !json.success) {
+    let json = null;
+    try {
+      json = await resp.json();
+    } catch (_e) {}
+
+    if (!resp.ok || !json || !json.success) {
       const msg =
         json && json.data && json.data.message
           ? json.data.message
-          : "Request failed.";
-      throw new Error(msg);
+          : `Request failed (${resp.status || "network"}).`;
+      const err = new Error(msg);
+      err.status = resp.status || 0;
+      const retryAfterHeader = resp.headers.get("Retry-After");
+      const retryAfterSeconds = parseInt(String(retryAfterHeader || ""), 10);
+      if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+        err.retryAfterMs = retryAfterSeconds * 1000;
+      }
+      throw err;
     }
     return json.data;
   }
@@ -171,6 +187,7 @@
       tempRow.dataset.jobId = String(jobId);
       tempRow.dataset.createdAt = String(Date.now());
       rowMap.set(jobId, tempRow);
+      knownHasActiveJobs = true;
 
       const statusHtml = statusToHtml(data.status || "queued", 0);
       setRow(tempRow, statusHtml, null, "");
@@ -178,6 +195,38 @@
     } catch (e) {
       setRow(tempRow, "error", null, e.message || "Upload failed.");
     }
+  }
+
+  let pollTimer = null;
+  let pollBackoffMs = 0;
+  let isPolling = false;
+  let knownHasActiveJobs = false;
+
+  function clearPollTimer() {
+    if (!pollTimer) return;
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+
+  function stopPolling() {
+    isPolling = false;
+    clearPollTimer();
+  }
+
+  function scheduleNextPoll() {
+    if (!isPolling || refreshInFlight || pollTimer || !knownHasActiveJobs) return;
+
+    const delay = pollBackoffMs > 0 ? pollBackoffMs : pollIntervalMs;
+    pollTimer = setTimeout(async () => {
+      pollTimer = null;
+      await refreshStatus();
+      scheduleNextPoll();
+    }, delay);
+  }
+
+  function startPolling() {
+    isPolling = true;
+    scheduleNextPoll();
   }
 
   let refreshInFlight = false;
@@ -190,6 +239,7 @@
 
     try {
       const data = await postForm("mtc_status", fd);
+      let activeJobCount = 0;
 
       (data.jobs || []).forEach((j) => {
         let row = rowMap.get(j.job_id);
@@ -208,6 +258,8 @@
           : Date.now();
         const expired = isExpiredByMidnight(createdAtMs);
         const queuedForMs = Math.max(0, Date.now() - createdAtMs);
+        const statusNorm = String(j.status || "").toLowerCase().trim();
+        const isActive = statusNorm === "queued" || statusNorm === "processing";
 
         if (expired) {
           setRow(
@@ -221,8 +273,15 @@
           const statusHtml = statusToHtml(j.status, queuedForMs);
           setRow(row, statusHtml, j.download_url, j.error);
           row.classList.remove("mtc-expired");
+          if (isActive) activeJobCount++;
         }
       });
+
+      knownHasActiveJobs = activeJobCount > 0;
+      pollBackoffMs = 0;
+      if (!knownHasActiveJobs) {
+        stopPolling();
+      }
 
       if (data.zip_url) {
         downloadAll.href = data.zip_url;
@@ -232,15 +291,24 @@
       }
     } catch (e) {
       // non-fatal
+      if (e && Number(e.status) === 429) {
+        const hintedMs =
+          Number.isFinite(e.retryAfterMs) && e.retryAfterMs > 0
+            ? e.retryAfterMs
+            : 0;
+        if (hintedMs > 0) {
+          pollBackoffMs = Math.min(
+            pollMaxBackoffMs,
+            Math.max(pollIntervalMs, hintedMs)
+          );
+        } else {
+          const nextBackoff = pollBackoffMs > 0 ? pollBackoffMs * 2 : pollIntervalMs * 2;
+          pollBackoffMs = Math.min(pollMaxBackoffMs, nextBackoff);
+        }
+      }
     } finally {
       refreshInFlight = false;
     }
-  }
-
-  let pollTimer = null;
-  function startPolling() {
-    if (pollTimer) return;
-    pollTimer = setInterval(refreshStatus, 2000);
   }
 
   uploadBtn.addEventListener("click", async () => {
@@ -251,11 +319,16 @@
       await uploadOne(f);
     }
 
-    await refreshStatus();
+    knownHasActiveJobs = true;
     startPolling();
+    await refreshStatus();
+    if (knownHasActiveJobs) startPolling();
   });
 
   resetBtn.addEventListener("click", () => {
+    stopPolling();
+    knownHasActiveJobs = false;
+    pollBackoffMs = 0;
     rowsEl.innerHTML = "";
     rowMap.clear();
     downloadAll.style.display = "none";
@@ -266,11 +339,13 @@
   // Re-check right after midnight
   setTimeout(() => {
     refreshStatus();
+    if (knownHasActiveJobs) startPolling();
     // optional: hard reset list at midnight (uncomment if desired)
     // rowsEl.innerHTML = "";
     // rowMap.clear();
   }, msUntilNextMidnightLocal() + 1000);
 
-  refreshStatus();
-  startPolling();
+  refreshStatus().then(() => {
+    if (knownHasActiveJobs) startPolling();
+  });
 })();

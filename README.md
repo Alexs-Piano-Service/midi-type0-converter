@@ -73,9 +73,15 @@ add_filter('mtc_max_upload_bytes', fn() => 10 * 1024 * 1024);
 add_filter('mtc_max_files_per_batch', fn() => 200);
 add_filter('mtc_download_ttl_seconds', fn() => DAY_IN_SECONDS);
 add_filter('mtc_max_queued_ui_ms', fn() => 6000);
+add_filter('mtc_poll_interval_ms', fn() => 2000);
+add_filter('mtc_poll_max_backoff_ms', fn() => 15000);
 
 add_filter('mtc_rate_limit_window_seconds', fn() => 10 * MINUTE_IN_SECONDS);
 add_filter('mtc_rate_limit_max_uploads_per_window', fn() => 80);
+add_filter('mtc_status_rate_limit_per_batch_window_seconds', fn() => 60);
+add_filter('mtc_status_rate_limit_per_batch_per_window', fn() => 240);
+add_filter('mtc_status_rate_limit_ip_window_seconds', fn() => 600);
+add_filter('mtc_status_rate_limit_ip_per_window', fn() => 1000);
 
 add_filter('mtc_queue_nudge_after_seconds', fn() => 3);
 add_filter('mtc_inline_process_after_seconds', fn() => 12);

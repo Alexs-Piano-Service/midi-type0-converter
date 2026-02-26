@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MIDI Type 1 → Type 0 Converter (Frontend)
  * Description: Upload many MIDI files asynchronously, converts Type 1 → Type 0, provides per-file and ZIP downloads.
- * Version: 1.1.2
+ * Version: 1.1.3
  * Author: Alexander Peppe
  * License: GPLv2 or later
  */
@@ -12,7 +12,7 @@ defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-mtc-midi-converter.php';
 
 final class MTC_Plugin {
-    const VERSION = '1.1.2';
+    const VERSION = '1.1.3';
     const TABLE   = 'mtc_jobs';
     const DIR_SLUG = 'mtc-private';
 
@@ -257,6 +257,8 @@ public static function enqueue_assets(): void {
         'maxFilesPerBatch' => (int) apply_filters('mtc_max_files_per_batch', 200),
         'downloadTtlSeconds' => (int) apply_filters('mtc_download_ttl_seconds', DAY_IN_SECONDS),
         'maxQueuedUiMs' => (int) apply_filters('mtc_max_queued_ui_ms', 6000),
+        'pollIntervalMs' => (int) apply_filters('mtc_poll_interval_ms', 2000),
+        'pollMaxBackoffMs' => (int) apply_filters('mtc_poll_max_backoff_ms', 15000),
     ]);
 }
 
@@ -267,13 +269,12 @@ private static function client_id(): string {
 
 private static function rl(string $bucket, int $limit, int $windowSeconds): void {
     $key = 'mtc_rl_' . $bucket . '_' . md5(self::client_id());
-    $count = (int) get_transient($key);
-
-    if ($count >= $limit) {
-        // For AJAX endpoints you can wp_send_json_error; for downloads use status_header + exit.
-        wp_send_json_error(['message' => 'Too many requests. Please try again shortly.'], 429);
-    }
-    set_transient($key, $count + 1, $windowSeconds);
+    self::rl_ajax(
+        $key,
+        $limit,
+        $windowSeconds,
+        'Too many requests. Please try again shortly.'
+    );
 }
 
 
@@ -421,12 +422,54 @@ if (!empty($scan['infected'])) {
 
 private static function rl_download(string $bucket, int $limit, int $windowSeconds): void {
     $key = 'mtc_rl_' . $bucket . '_' . md5(self::client_id());
+    $limit = max(1, $limit);
+    $windowSeconds = max(1, $windowSeconds);
     $count = (int) get_transient($key);
     if ($count >= $limit) {
+        header('Retry-After: ' . $windowSeconds);
         status_header(429);
         exit;
     }
     set_transient($key, $count + 1, $windowSeconds);
+}
+
+private static function rl_ajax(string $key, int $limit, int $windowSeconds, string $message): void {
+    $limit = max(1, $limit);
+    $windowSeconds = max(1, $windowSeconds);
+
+    $count = (int) get_transient($key);
+    if ($count >= $limit) {
+        header('Retry-After: ' . $windowSeconds);
+        wp_send_json_error(['message' => $message], 429);
+    }
+    set_transient($key, $count + 1, $windowSeconds);
+}
+
+private static function rl_status(string $batch_id): void {
+    $client = self::client_id();
+
+    $per_batch_window = (int) apply_filters('mtc_status_rate_limit_per_batch_window_seconds', 60);
+    $per_batch_limit = (int) apply_filters('mtc_status_rate_limit_per_batch_per_window', 240);
+
+    $global_window = (int) apply_filters('mtc_status_rate_limit_ip_window_seconds', 600);
+    $global_limit = (int) apply_filters('mtc_status_rate_limit_ip_per_window', 1000);
+
+    $batch_key = 'mtc_rl_status_batch_' . md5($client . '|' . $batch_id);
+    $global_key = 'mtc_rl_status_ip_' . md5($client);
+
+    self::rl_ajax(
+        $batch_key,
+        $per_batch_limit,
+        $per_batch_window,
+        'Too many status requests for this batch. Please slow down.'
+    );
+
+    self::rl_ajax(
+        $global_key,
+        $global_limit,
+        $global_window,
+        'Too many status requests. Please try again shortly.'
+    );
 }
 
 private static function nudge_batch_queue(string $batch_id): void {
@@ -495,12 +538,13 @@ private static function nudge_batch_queue(string $batch_id): void {
 
 public static function ajax_status(): void {
 	check_ajax_referer('mtc_nonce');
-   	self::rl('status', 120, 60);         // 120/min
 
     $batch_id = isset($_POST['batch_id']) ? self::normalize_batch_id((string) $_POST['batch_id']) : '';
     if ($batch_id === '') {
         wp_send_json_error(['message' => 'Invalid batch id.'], 400);
     }
+
+    self::rl_status($batch_id);
 
     self::nudge_batch_queue($batch_id);
 
