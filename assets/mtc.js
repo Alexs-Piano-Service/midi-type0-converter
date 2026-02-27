@@ -128,9 +128,62 @@
     }
   }
 
-  async function postForm(action, formData) {
-    formData.append("action", action);
-    formData.append("_ajax_nonce", cfg.nonce);
+  let nonceRefreshPromise = null;
+
+  async function refreshNonce() {
+    if (nonceRefreshPromise) return nonceRefreshPromise;
+
+    nonceRefreshPromise = (async () => {
+      const fd = new FormData();
+      fd.append("action", "mtc_refresh_nonce");
+
+      const resp = await fetch(
+        cfg.ajaxUrl + "?action=" + encodeURIComponent("mtc_refresh_nonce"),
+        {
+          method: "POST",
+          body: fd,
+          credentials: "same-origin",
+        }
+      );
+
+      const rawText = await resp.text();
+      let json = null;
+      try {
+        json = rawText ? JSON.parse(rawText) : null;
+      } catch (_e) {}
+
+      if (
+        !resp.ok ||
+        !json ||
+        !json.success ||
+        !json.data ||
+        !json.data.nonce
+      ) {
+        throw new Error("Unable to refresh security token.");
+      }
+
+      cfg.nonce = String(json.data.nonce);
+      return cfg.nonce;
+    })();
+
+    try {
+      return await nonceRefreshPromise;
+    } finally {
+      nonceRefreshPromise = null;
+    }
+  }
+
+  function isNonceFailure(resp, rawText) {
+    if (!resp || Number(resp.status) !== 403) return false;
+    return String(rawText || "").trim() === "-1";
+  }
+
+  async function postForm(action, formData, options) {
+    const opts = options || {};
+    const allowNonceRetry = opts.allowNonceRetry !== false;
+
+    formData.set("action", action);
+    formData.set("_ajax_nonce", cfg.nonce || "");
 
     const resp = await fetch(
       cfg.ajaxUrl + "?action=" + encodeURIComponent(action),
@@ -141,15 +194,23 @@
       }
     );
 
+    const rawText = await resp.text();
     let json = null;
     try {
-      json = await resp.json();
+      json = rawText ? JSON.parse(rawText) : null;
     } catch (_e) {}
+
+    if (allowNonceRetry && isNonceFailure(resp, rawText)) {
+      await refreshNonce();
+      return postForm(action, formData, { allowNonceRetry: false });
+    }
 
     if (!resp.ok || !json || !json.success) {
       const msg =
         json && json.data && json.data.message
           ? json.data.message
+          : String(rawText || "").trim() === "-1"
+          ? "Request denied (expired security token). Retrying failed; refresh and try again."
           : `Request failed (${resp.status || "network"}).`;
       const err = new Error(msg);
       err.status = resp.status || 0;

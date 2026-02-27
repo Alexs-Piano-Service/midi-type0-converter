@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MIDI Type 1 → Type 0 Converter (Frontend)
  * Description: Upload many MIDI files asynchronously, converts Type 1 → Type 0, provides per-file and ZIP downloads.
- * Version: 1.1.3
+ * Version: 1.1.4
  * Author: Alexander Peppe
  * License: GPLv2 or later
  */
@@ -12,7 +12,7 @@ defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-mtc-midi-converter.php';
 
 final class MTC_Plugin {
-    const VERSION = '1.1.3';
+    const VERSION = '1.1.4';
     const TABLE   = 'mtc_jobs';
     const DIR_SLUG = 'mtc-private';
 
@@ -29,6 +29,9 @@ final class MTC_Plugin {
 
         add_action('wp_ajax_nopriv_mtc_status', [__CLASS__, 'ajax_status']);
         add_action('wp_ajax_mtc_status',       [__CLASS__, 'ajax_status']);
+
+        add_action('wp_ajax_nopriv_mtc_refresh_nonce', [__CLASS__, 'ajax_refresh_nonce']);
+        add_action('wp_ajax_mtc_refresh_nonce',       [__CLASS__, 'ajax_refresh_nonce']);
 
         add_action('mtc_process_job', [__CLASS__, 'process_job'], 10, 1);
         add_action('mtc_cleanup',     [__CLASS__, 'cleanup']);
@@ -262,9 +265,90 @@ public static function enqueue_assets(): void {
     ]);
 }
 
+private static function sanitize_ip(string $ip): string {
+    $ip = trim($ip);
+    if ($ip === '') return '';
+    return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+}
+
+private static function ip_matches_range(string $ip, string $range): bool {
+    $range = trim($range);
+    if ($range === '') return false;
+
+    if (strpos($range, '/') === false) {
+        $candidate = self::sanitize_ip($range);
+        return $candidate !== '' && $candidate === $ip;
+    }
+
+    [$subnet, $bitsRaw] = explode('/', $range, 2);
+    $subnet = self::sanitize_ip($subnet);
+    if ($subnet === '' || !is_numeric($bitsRaw)) return false;
+
+    $bits = (int) $bitsRaw;
+
+    $ipBin = @inet_pton($ip);
+    $subnetBin = @inet_pton($subnet);
+    if ($ipBin === false || $subnetBin === false) return false;
+    if (strlen($ipBin) !== strlen($subnetBin)) return false;
+
+    $maxBits = strlen($ipBin) * 8;
+    if ($bits < 0 || $bits > $maxBits) return false;
+
+    $fullBytes = intdiv($bits, 8);
+    $partialBits = $bits % 8;
+
+    if ($fullBytes > 0 && substr($ipBin, 0, $fullBytes) !== substr($subnetBin, 0, $fullBytes)) {
+        return false;
+    }
+
+    if ($partialBits === 0) return true;
+
+    $mask = (0xFF << (8 - $partialBits)) & 0xFF;
+    return ((ord($ipBin[$fullBytes]) & $mask) === (ord($subnetBin[$fullBytes]) & $mask));
+}
+
+private static function is_trusted_proxy(string $ip): bool {
+    $trusted = apply_filters('mtc_trusted_proxies', ['127.0.0.1', '::1']);
+    if (!is_array($trusted)) return false;
+
+    foreach ($trusted as $range) {
+        if (!is_string($range)) continue;
+        if (self::ip_matches_range($ip, $range)) return true;
+    }
+    return false;
+}
+
+private static function extract_forwarded_ip(string $raw): string {
+    if ($raw === '') return '';
+    $parts = explode(',', $raw);
+    foreach ($parts as $part) {
+        $ip = self::sanitize_ip($part);
+        if ($ip !== '') {
+            return $ip;
+        }
+    }
+    return '';
+}
+
 private static function client_id(): string {
-    // IP-only is simplest; optionally add UA: md5($ip.'|'.($_SERVER['HTTP_USER_AGENT'] ?? ''))
-    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $remote = self::sanitize_ip((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
+    if ($remote === '') return 'unknown';
+
+    // Only trust forwarding headers if the immediate peer is one of our proxies.
+    if (!self::is_trusted_proxy($remote)) {
+        return $remote;
+    }
+
+    $cfIp = self::sanitize_ip((string) ($_SERVER['HTTP_CF_CONNECTING_IP'] ?? ''));
+    if ($cfIp !== '') return $cfIp;
+
+    $xffIp = self::extract_forwarded_ip((string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''));
+    if ($xffIp !== '') return $xffIp;
+
+    $xRealIp = self::sanitize_ip((string) ($_SERVER['HTTP_X_REAL_IP'] ?? ''));
+    if ($xRealIp !== '') return $xRealIp;
+
+    return $remote;
 }
 
 private static function rl(string $bucket, int $limit, int $windowSeconds): void {
@@ -307,6 +391,14 @@ public static function shortcode(): string {
     </div>
     <?php
     return (string) ob_get_clean();
+}
+
+
+public static function ajax_refresh_nonce(): void {
+    self::rl('nonce', 120, 60);
+    wp_send_json_success([
+        'nonce' => wp_create_nonce('mtc_nonce'),
+    ]);
 }
 
 
