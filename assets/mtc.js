@@ -40,6 +40,10 @@
     pollIntervalMs,
     Number(cfg.pollMaxBackoffMs || 15000)
   );
+  const proactiveNonceRefreshMs = Math.max(
+    60000,
+    Number(cfg.proactiveNonceRefreshMs || 15 * 60 * 1000)
+  );
 
   function waitingLabel(cssClass, text) {
     return `
@@ -129,6 +133,7 @@
   }
 
   let nonceRefreshPromise = null;
+  let lastNonceRefreshAttemptAt = 0;
 
   async function refreshNonce() {
     if (nonceRefreshPromise) return nonceRefreshPromise;
@@ -173,9 +178,37 @@
     }
   }
 
-  function isNonceFailure(resp, rawText) {
+  async function maybeRefreshNonce(options) {
+    const opts = options || {};
+    const force = opts.force === true;
+    const minGapMs = Number.isFinite(opts.minGapMs)
+      ? Math.max(0, Number(opts.minGapMs))
+      : 30000;
+
+    const now = Date.now();
+    if (!force && now - lastNonceRefreshAttemptAt < minGapMs) {
+      return cfg.nonce || "";
+    }
+
+    lastNonceRefreshAttemptAt = now;
+    return refreshNonce();
+  }
+
+  function isNonceFailure(resp, rawText, json) {
     if (!resp || Number(resp.status) !== 403) return false;
-    return String(rawText || "").trim() === "-1";
+    if (String(rawText || "").trim() === "-1") return true;
+
+    const code =
+      json && json.data && json.data.code
+        ? String(json.data.code).toLowerCase().trim()
+        : "";
+    if (code === "bad_nonce") return true;
+
+    const message =
+      json && json.data && json.data.message
+        ? String(json.data.message).toLowerCase()
+        : "";
+    return message.includes("security token");
   }
 
   async function postForm(action, formData, options) {
@@ -200,7 +233,7 @@
       json = rawText ? JSON.parse(rawText) : null;
     } catch (_e) {}
 
-    if (allowNonceRetry && isNonceFailure(resp, rawText)) {
+    if (allowNonceRetry && isNonceFailure(resp, rawText, json)) {
       await refreshNonce();
       return postForm(action, formData, { allowNonceRetry: false });
     }
@@ -244,10 +277,15 @@
     try {
       const data = await postForm("mtc_upload", fd);
       const jobId = data.job_id;
+      const jobIdKey = String(jobId);
 
       tempRow.dataset.jobId = String(jobId);
-      tempRow.dataset.createdAt = String(Date.now());
-      rowMap.set(jobId, tempRow);
+      if (Number.isFinite(Number(data.created_at_ms))) {
+        tempRow.dataset.createdAt = String(Number(data.created_at_ms));
+      } else {
+        tempRow.dataset.createdAt = String(Date.now());
+      }
+      rowMap.set(jobIdKey, tempRow);
       knownHasActiveJobs = true;
 
       const statusHtml = statusToHtml(data.status || "queued", 0);
@@ -262,6 +300,7 @@
   let pollBackoffMs = 0;
   let isPolling = false;
   let knownHasActiveJobs = false;
+  let proactiveNonceTimer = null;
 
   function clearPollTimer() {
     if (!pollTimer) return;
@@ -272,6 +311,30 @@
   function stopPolling() {
     isPolling = false;
     clearPollTimer();
+  }
+
+  function clearProactiveNonceTimer() {
+    if (!proactiveNonceTimer) return;
+    clearTimeout(proactiveNonceTimer);
+    proactiveNonceTimer = null;
+  }
+
+  function scheduleProactiveNonceRefresh() {
+    clearProactiveNonceTimer();
+    proactiveNonceTimer = setTimeout(async () => {
+      try {
+        await maybeRefreshNonce();
+      } catch (_e) {
+        // Keep UI running even if refresh endpoint is temporarily unavailable.
+      } finally {
+        scheduleProactiveNonceRefresh();
+      }
+    }, proactiveNonceRefreshMs);
+  }
+
+  function onForeground() {
+    if (document.visibilityState && document.visibilityState !== "visible") return;
+    maybeRefreshNonce().catch(() => {});
   }
 
   function scheduleNextPoll() {
@@ -301,17 +364,25 @@
     try {
       const data = await postForm("mtc_status", fd);
       let activeJobCount = 0;
+      const seenJobIds = new Set();
 
       (data.jobs || []).forEach((j) => {
-        let row = rowMap.get(j.job_id);
+        const jobIdKey = String(j.job_id);
+        seenJobIds.add(jobIdKey);
+
+        let row = rowMap.get(jobIdKey);
         if (!row) {
           row = makeRow(j.name, "", j.job_id);
           rowsEl.appendChild(row);
-          rowMap.set(j.job_id, row);
+          rowMap.set(jobIdKey, row);
         }
 
-        // Ensure createdAt exists
-        row.dataset.createdAt = row.dataset.createdAt || String(Date.now());
+        const serverCreatedAtMs = Number(j.created_at_ms);
+        if (Number.isFinite(serverCreatedAtMs) && serverCreatedAtMs > 0) {
+          row.dataset.createdAt = String(serverCreatedAtMs);
+        } else if (!row.dataset.createdAt) {
+          row.dataset.createdAt = String(Date.now());
+        }
 
         const rawCreatedAtMs = parseInt(row.dataset.createdAt, 10);
         const createdAtMs = Number.isFinite(rawCreatedAtMs)
@@ -337,6 +408,14 @@
           if (isActive) activeJobCount++;
         }
       });
+
+      for (const [jobId, row] of rowMap.entries()) {
+        if (seenJobIds.has(String(jobId))) continue;
+        if (row && row.parentNode) {
+          row.parentNode.removeChild(row);
+        }
+        rowMap.delete(jobId);
+      }
 
       knownHasActiveJobs = activeJobCount > 0;
       pollBackoffMs = 0;
@@ -388,6 +467,7 @@
 
   resetBtn.addEventListener("click", () => {
     stopPolling();
+    clearProactiveNonceTimer();
     knownHasActiveJobs = false;
     pollBackoffMs = 0;
     rowsEl.innerHTML = "";
@@ -405,6 +485,13 @@
     // rowsEl.innerHTML = "";
     // rowMap.clear();
   }, msUntilNextMidnightLocal() + 1000);
+
+  document.addEventListener("visibilitychange", onForeground);
+  window.addEventListener("focus", onForeground);
+  window.addEventListener("pageshow", onForeground);
+
+  scheduleProactiveNonceRefresh();
+  maybeRefreshNonce().catch(() => {});
 
   refreshStatus().then(() => {
     if (knownHasActiveJobs) startPolling();

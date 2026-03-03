@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MIDI Type 1 → Type 0 Converter (Frontend)
  * Description: Upload many MIDI files asynchronously, converts Type 1 → Type 0, provides per-file and ZIP downloads.
- * Version: 1.1.4
+ * Version: 1.1.7
  * Author: Alexander Peppe
  * License: GPLv2 or later
  */
@@ -12,7 +12,7 @@ defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-mtc-midi-converter.php';
 
 final class MTC_Plugin {
-    const VERSION = '1.1.4';
+    const VERSION = '1.1.7';
     const TABLE   = 'mtc_jobs';
     const DIR_SLUG = 'mtc-private';
 
@@ -109,6 +109,115 @@ private static function normalize_batch_id(string $batch_id): string {
         return '';
     }
     return $batch_id;
+}
+
+private static function ini_size_to_bytes(string $raw): int {
+    $raw = trim($raw);
+    if ($raw === '') return 0;
+
+    $unit = strtolower(substr($raw, -1));
+    $num = (float) $raw;
+    if ($num <= 0) return 0;
+
+    switch ($unit) {
+        case 'g':
+            $num *= 1024;
+            // fallthrough
+        case 'm':
+            $num *= 1024;
+            // fallthrough
+        case 'k':
+            $num *= 1024;
+            break;
+    }
+
+    if (!is_finite($num) || $num <= 0) return 0;
+    return (int) round($num);
+}
+
+private static function request_exceeds_post_max(): bool {
+    $postMax = self::ini_size_to_bytes((string) ini_get('post_max_size'));
+    if ($postMax <= 0) return false;
+
+    $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : 0;
+    return $contentLength > 0 && $contentLength > $postMax;
+}
+
+private static function verify_ajax_nonce_or_error(): void {
+    if (check_ajax_referer('mtc_nonce', '_ajax_nonce', false)) {
+        return;
+    }
+
+    wp_send_json_error([
+        'message' => 'Request denied (expired security token). Please refresh and try again.',
+        'code' => 'bad_nonce',
+    ], 403);
+}
+
+private static function today_midnight_mysql(): string {
+    $tz = function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone('UTC');
+    $now = new DateTimeImmutable('now', $tz);
+    return $now->setTime(0, 0, 0)->format('Y-m-d H:i:s');
+}
+
+private static function purge_stale_jobs_for_batch(string $batch_id): void {
+    global $wpdb;
+    $table = self::table_name();
+    $midnight = self::today_midnight_mysql();
+
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT id, status, original_path, converted_path, created_at
+         FROM {$table}
+         WHERE batch_id = %s",
+        $batch_id
+    ));
+
+    if (!$rows) {
+        return;
+    }
+
+    $purgeIds = [];
+    foreach ($rows as $r) {
+        $jobId = (int) ($r->id ?? 0);
+        if ($jobId <= 0) continue;
+
+        $status = (string) ($r->status ?? '');
+        $createdAt = (string) ($r->created_at ?? '');
+        $origPath = (string) ($r->original_path ?? '');
+        $convPath = (string) ($r->converted_path ?? '');
+
+        $expiredByMidnight = ($createdAt !== '' && $createdAt < $midnight);
+        $missingRequiredFile = false;
+
+        if ($status === 'done') {
+            $missingRequiredFile = ($convPath === '' || !is_file($convPath));
+        } elseif ($status === 'queued' || $status === 'processing') {
+            $missingRequiredFile = ($origPath === '' || !is_file($origPath));
+        }
+
+        if (!$expiredByMidnight && !$missingRequiredFile) {
+            continue;
+        }
+
+        $purgeIds[] = $jobId;
+
+        if ($origPath !== '' && is_file($origPath)) {
+            @unlink($origPath);
+        }
+        if ($convPath !== '' && is_file($convPath)) {
+            @unlink($convPath);
+        }
+    }
+
+    if (!$purgeIds) {
+        return;
+    }
+
+    $placeholders = implode(',', array_fill(0, count($purgeIds), '%d'));
+    $sql = $wpdb->prepare("DELETE FROM {$table} WHERE id IN ({$placeholders})", ...$purgeIds);
+    if (is_string($sql) && $sql !== '') {
+        $wpdb->query($sql);
+    }
 }
 
 
@@ -262,6 +371,7 @@ public static function enqueue_assets(): void {
         'maxQueuedUiMs' => (int) apply_filters('mtc_max_queued_ui_ms', 6000),
         'pollIntervalMs' => (int) apply_filters('mtc_poll_interval_ms', 2000),
         'pollMaxBackoffMs' => (int) apply_filters('mtc_poll_max_backoff_ms', 15000),
+        'proactiveNonceRefreshMs' => (int) apply_filters('mtc_proactive_nonce_refresh_ms', 15 * MINUTE_IN_SECONDS * 1000),
     ]);
 }
 
@@ -403,7 +513,13 @@ public static function ajax_refresh_nonce(): void {
 
 
     public static function ajax_upload(): void {
-	check_ajax_referer('mtc_nonce');
+        if (self::request_exceeds_post_max()) {
+            wp_send_json_error([
+                'message' => 'Upload exceeds the server request size limit. Please upload a smaller file.',
+                'code' => 'post_too_large',
+            ], 413);
+        }
+	self::verify_ajax_nonce_or_error();
         self::rl('upload', 10, 60);          // 10/min
     	self::rl('upload10', 60, 600);       // 60/10min
 
@@ -509,6 +625,7 @@ if (!empty($scan['infected'])) {
             'job_id' => $job_id,
             'name'   => $orig_name,
 	    'status' => 'queued',
+            'created_at_ms' => (int) (current_time('timestamp') * 1000),
         ]);
     }
 
@@ -629,7 +746,7 @@ private static function nudge_batch_queue(string $batch_id): void {
 }
 
 public static function ajax_status(): void {
-	check_ajax_referer('mtc_nonce');
+	self::verify_ajax_nonce_or_error();
 
     $batch_id = isset($_POST['batch_id']) ? self::normalize_batch_id((string) $_POST['batch_id']) : '';
     if ($batch_id === '') {
@@ -637,6 +754,8 @@ public static function ajax_status(): void {
     }
 
     self::rl_status($batch_id);
+
+    self::purge_stale_jobs_for_batch($batch_id);
 
     self::nudge_batch_queue($batch_id);
 
@@ -646,6 +765,7 @@ public static function ajax_status(): void {
     $rows = $wpdb->get_results(
         $wpdb->prepare(
             "SELECT id, original_name, status, error_msg
+                   , created_at
              FROM {$table}
              WHERE batch_id = %s
              ORDER BY id ASC",
@@ -668,8 +788,14 @@ public static function ajax_status(): void {
             'name'   => (string) $r->original_name,
             'status' => $status,
             'error'  => (string) ($r->error_msg ?? ''),
+            'created_at_ms' => null,
             'download_url' => null,
         ];
+
+        $createdAtTs = strtotime((string) ($r->created_at ?? ''));
+        if ($createdAtTs !== false) {
+            $job['created_at_ms'] = (int) ($createdAtTs * 1000);
+        }
 
         if ($status === 'done') {
             $done_count++;
