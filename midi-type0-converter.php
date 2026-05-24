@@ -2,7 +2,7 @@
 /**
  * Plugin Name: MIDI Type 1 → Type 0 Converter (Frontend)
  * Description: Upload many MIDI files asynchronously, converts Type 1 → Type 0, provides per-file and ZIP downloads.
- * Version: 1.1.7
+ * Version: 1.1.8
  * Author: Alexander Peppe
  * License: GPLv2 or later
  */
@@ -12,7 +12,7 @@ defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-mtc-midi-converter.php';
 
 final class MTC_Plugin {
-    const VERSION = '1.1.7';
+    const VERSION = '1.1.8';
     const TABLE   = 'mtc_jobs';
     const DIR_SLUG = 'mtc-private';
 
@@ -583,17 +583,17 @@ public static function ajax_refresh_nonce(): void {
         if ($base === '') $base = 'midi';
         $stored_path = $dir . '/' . $rand . '-' . $base . '.mid';
 
-$scan = self::clamav_scan($f['tmp_name']);
+        $scan = self::clamav_scan($f['tmp_name']);
 
+        $failOpen = (bool) apply_filters('mtc_clamav_fail_open', false); // default: fail closed when scanner is enabled
+        if (!$scan['ok'] && !$failOpen) {
+            self::log_clamav_failure($scan);
+            wp_send_json_error(['message' => 'Antivirus failed.'], 400);
+        }
 
-$failOpen = (bool) apply_filters('mtc_clamav_fail_open', false); // default: fail closed
-if (!$scan['ok'] && !$failOpen) {
-    wp_send_json_error(['message' => "Antivirus failed."], 400);
-}
-
-if (!empty($scan['infected'])) {
-    wp_send_json_error(['message' => 'Virus detected.'], 400);
-}
+        if (!empty($scan['infected'])) {
+            wp_send_json_error(['message' => 'Virus detected.'], 400);
+        }
 
         if (!@move_uploaded_file($f['tmp_name'], $stored_path)) {
             wp_send_json_error(['message' => 'Failed to move uploaded file.'], 500);
@@ -828,7 +828,7 @@ public static function ajax_status(): void {
 }
 
 private static function clamav_scan(string $filePath): array {
-    $enabled = (bool) apply_filters('mtc_clamav_enabled', true);
+    $enabled = (bool) apply_filters('mtc_clamav_enabled', false);
     if (!$enabled) {
         return ['ok' => true, 'infected' => false, 'signature' => ''];
     }
@@ -880,6 +880,15 @@ private static function clamav_scan(string $filePath): array {
 
     // Timeout returns 124 typically; treat as error.
     return ['ok' => false, 'infected' => false, 'signature' => '', 'error' => $output ?: ('clamdscan error code ' . $exitCode)];
+}
+
+private static function log_clamav_failure(array $scan): void {
+    $error = isset($scan['error']) ? trim((string) $scan['error']) : '';
+    if ($error === '') {
+        $error = 'unknown scanner failure';
+    }
+
+    error_log('[MTC] ClamAV scan failed: ' . $error);
 }
 
 

@@ -11,14 +11,14 @@ Frontend WordPress plugin that lets users upload `.mid/.midi` files, converts MI
 - Batch ZIP download link (when `ZipArchive` is available)
 - Private storage under `wp-content/uploads/mtc-private`
 - Rate limits for upload/status/download endpoints
-- Optional ClamAV scan before storing uploads
+- Optional ClamAV scan before storing uploads (disabled by default)
 
 ## Requirements
 
 - WordPress (plugin architecture + AJAX + cron APIs)
 - PHP 8.0+ recommended (uses modern PHP features like `match`)
 - `ZipArchive` extension for "Download All (ZIP)"
-- Optional: `clamdscan` for antivirus scanning
+- Optional: `clamdscan` for antivirus scanning when enabled by filter
 
 ## Installation
 
@@ -37,7 +37,7 @@ Frontend WordPress plugin that lets users upload `.mid/.midi` files, converts MI
 ## How It Works
 
 - Upload endpoint: `mtc_upload` (`wp_ajax_*`)
-  - Validates nonce, extension, MIDI header (`MThd`), size limits, and optional ClamAV scan.
+  - Validates nonce, extension, MIDI header (`MThd`), size limits, and optional ClamAV scan when enabled.
   - Persists job row in DB table with initial `queued` status.
   - Schedules background job via `wp_schedule_single_event`.
 - Status endpoint: `mtc_status` (`wp_ajax_*`)
@@ -86,6 +86,7 @@ add_filter('mtc_status_rate_limit_ip_per_window', fn() => 1000);
 add_filter('mtc_queue_nudge_after_seconds', fn() => 3);
 add_filter('mtc_inline_process_after_seconds', fn() => 12);
 
+// ClamAV is disabled by default. Enable it only on hosts with a working clamdscan setup.
 add_filter('mtc_clamav_enabled', fn() => true);
 add_filter('mtc_clamav_fail_open', fn() => false);
 add_filter('mtc_clamdscan_path', fn() => '/usr/bin/clamdscan');
@@ -103,7 +104,7 @@ add_filter('mtc_cleanup_days', fn() => 2);
 - Uploaded files stored in a non-public uploads subdirectory
 - Direct-access blocks for Apache/IIS (`.htaccess`, `web.config`)
 - MIME/header checks plus binary MIDI magic check (`MThd`)
-- Optional AV scanning through `clamdscan`
+- Optional AV scanning through `clamdscan` when enabled
 
 ## Operational Notes
 
